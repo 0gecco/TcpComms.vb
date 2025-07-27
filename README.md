@@ -37,7 +37,7 @@ TCP Client Usage
 ================
 
 1. Clone the repository.
-2. Reference `TcpClient.vb`, `BufferPools.vb`, and `SimpleBufferPool.vb` in your VB.NET project (targeting .NET Framework 4.7.2).
+2. Reference `TcpClient.vb`, `BufferPools.vb`, and `SimpleBufferPool.vb` in your VB.NET project (targeting .NET Framework >=4.7.2).
 3. Set the same packet delimiter as used on the server.
 4. Connect to the server using `ConnectAsync`.
 5. Use `SendData`, `SendStreamData`, or `StartStreaming` as needed.
