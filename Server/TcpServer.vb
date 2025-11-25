@@ -1,17 +1,10 @@
-﻿Imports System.Collections.Concurrent
+Imports System.Collections.Concurrent
 Imports System.Net.Sockets
 Imports System.Threading
 Imports System.Buffers
 Imports System.Text
 Imports System.Net
 Imports System.IO
-
-'          oo   dP                            
-'               88                            
-' 88d888b. dP d8888P 88d88b. .d8888b. d888888b
-' 88'  `88 88   88   88' `dP 88'  `88    .d8P'
-' 88    88 88   88   88      88.  .88  .Y8P   
-' dP    dP dP   dP   dP      `88888P' d888888P
 
 ' 88888           .d88b                                         8    
 '   8   .d8b 88b. 8P    .d8b. 8d8b.d8b. 8d8b.d8b. d88b   Yb  dP 88b. 
@@ -29,6 +22,11 @@ Public Class TcpServer
 
     Implements IDisposable
 
+    Private Enum PacketType As Byte
+        Delimited = 0
+        Stream = 1
+    End Enum
+
     Public Event LogEvent(level As LogLevel, time As String, log As String)
     Public Event UploadedBytesCount(uploadedBytes As Long, formattedBytes As String)
     Public Event ClearClientList()
@@ -39,7 +37,7 @@ Public Class TcpServer
     Public Event OnExceptionOccurred(ex As Exception)
     Public Event OnDataHandlerException(socket As Integer, ex As Exception)
     Public Event OnImageDataReceived(socket As Integer, imageBytes As Byte())
-    Public Event OnStreamDataReceived(data As Byte())
+    Public Event OnStreamDataReceived(clientSocket As Integer, data As Byte())
 
     ' Client parameters
     Public Property ClientSendTimeout As Integer = 10 * 1000 ' 10 seconds
@@ -76,12 +74,11 @@ Public Class TcpServer
     Private ReadOnly _disconnectFlags As New ConcurrentDictionary(Of Integer, Boolean)
     Private ReadOnly _connectionAttempts As New ConcurrentDictionary(Of Integer, DateTime)
     Private ReadOnly _disconnecting As New ConcurrentDictionary(Of Integer, Boolean)
-    Private ReadOnly _sockets(MaxClients) As Socket
+    Private ReadOnly _sockets() As Socket
     Private ReadOnly _packetDelimiter As String
     Private ReadOnly _delimiterLps As Integer()
     Private ReadOnly _imagePrefix As Byte()
     Private ReadOnly _delimiter As Byte()
-    Private ReadOnly _disposeLock As New Object()
     Private ReadOnly _clientIpAddressesLock As New Object()
 
     Public Sub New(delimiter As String)
@@ -94,8 +91,8 @@ Public Class TcpServer
         _rejectedConnections = 0
         _packetDelimiter = delimiter
         _disposed = False
-
-        ThreadPool.SetMaxThreads(MaxClients + 1, MaxClients + 1)
+        ' Remove the upper bound
+        ReDim _sockets(MaxClients - 1)
 
         ' Pre-compute delimiters and cache the LPS array for the delimiter
         _delimiterLps = ComputeLpsArray(Encoding.UTF8.GetBytes(delimiter))
@@ -115,16 +112,18 @@ Public Class TcpServer
             _tcpListener.Server.ReceiveTimeout = ReceiveTimeout
             _tcpListener.Start(BackLog)
 
+            ' Handle incoming client on separate thread(s)
             _clientHandlerThread = New Thread(AddressOf HandleIncomingClients) With {
                 .IsBackground = True,
                 .Name = "ClientHandler_Thread"
             }
-            _clientHandlerThread.Start() ' Handle incoming client on separate thread
+            _clientHandlerThread.Start()
 
             Log(LogLevel.Ok, $"Server started on port {port}.")
         Catch ex As Exception
             RaiseEvent OnExceptionOccurred(ex)
-            [Stop]() ' Ensure the server is stopped if it failed to start
+            ' Ensure the server is stopped if it failed to start
+            [Stop]()
         End Try
     End Sub
 
@@ -173,7 +172,8 @@ Public Class TcpServer
     Public Sub StartStreaming(socketId As Integer)
         _streamingClients.TryAdd(socketId, True)
         If _sockets(socketId) IsNot Nothing Then
-            _sockets(socketId).NoDelay = True ' Disable Nagle's algorithm
+            ' Disable Nagle's algorithm
+            _sockets(socketId).NoDelay = True
             _sockets(socketId).SendBufferSize = StreamBufferSize
         End If
     End Sub
@@ -187,16 +187,26 @@ Public Class TcpServer
     End Sub
 
     Public Sub SendStreamData(socketId As Integer, data As Byte())
-        If socketId < 0 OrElse socketId >= _sockets.Length Then
-            Throw New ArgumentOutOfRangeException(NameOf(socketId))
-        End If
+        If Not OnlineClients.Contains(socketId) Then Return
+        If socketId < 0 OrElse socketId >= _sockets.Length Then Throw New ArgumentOutOfRangeException(NameOf(socketId))
+        If Not _streamingClients.ContainsKey(socketId) Then Throw New InvalidOperationException("Client is not in streaming mode")
 
-        If Not _streamingClients.ContainsKey(socketId) Then
-            Throw New InvalidOperationException("Client is not in streaming mode")
-        End If
+        Dim s = _sockets(socketId)
+        If s Is Nothing OrElse Not s.Connected Then Return
 
         Try
-            _sockets(socketId).Send(data, 0, data.Length, SocketFlags.None)
+            ' Create and send header
+            ' 1 byte type + 4 byte length (little endian)
+            Dim header(4) As Byte
+            header(0) = PacketType.Stream
+            Buffer.BlockCopy(BitConverter.GetBytes(data.Length), 0, header, 1, 4)
+
+            SyncLock s
+                ' Send header
+                SendAll(s, header, 0, 5)
+                ' Send payload
+                SendAll(s, data, 0, data.Length)
+            End SyncLock
         Catch ex As Exception
             RaiseEvent OnExceptionOccurred(ex)
             DisconnectClient(socketId)
@@ -204,6 +214,9 @@ Public Class TcpServer
     End Sub
 
     Public Sub SendImageData(targetSocket As Integer, imageBytes As Byte())
+        Dim s = _sockets(targetSocket)
+        If s Is Nothing OrElse Not s.Connected Then Return
+
         Try
             Dim prefixedImageData As Byte() = Encoding.UTF8.GetBytes(ImagePacketPrefix).Concat(imageBytes).ToArray()
             SendDataInternal(targetSocket, prefixedImageData)
@@ -213,37 +226,101 @@ Public Class TcpServer
     End Sub
 
     Public Sub SendFile(targetSocket As Integer, ByRef filePath As String)
+        Dim s = _sockets(targetSocket)
+        If s Is Nothing OrElse Not s.Connected Then Return
+
         Try
             Dim uploadedBytes = New FileInfo(filePath).Length
             RaiseEvent UploadedBytesCount(uploadedBytes, FormatBytes(uploadedBytes))
             Dim postBuffer As Byte() = Encoding.UTF8.GetBytes(_packetDelimiter)
-            _sockets(targetSocket).SendFile(filePath, Encoding.UTF8.GetBytes(FilePacketPrefix), postBuffer, TransmitFileOptions.UseDefaultWorkerThread)
+            SyncLock s
+                s.SendFile(filePath, Encoding.UTF8.GetBytes(FilePacketPrefix), postBuffer, TransmitFileOptions.UseDefaultWorkerThread)
+            End SyncLock
         Catch ex As Exception
             RaiseEvent OnExceptionOccurred(ex)
         End Try
     End Sub
 
-    Public Sub SendData(targetSocket As Integer, data As String)
-        SendDataInternal(targetSocket, Encoding.UTF8.GetBytes(data))
+    Public Sub SendData(socketId As Integer, data As String)
+        SendDataInternal(socketId, Encoding.UTF8.GetBytes(data))
     End Sub
 
-    Public Sub SendData(targetSocket As Integer, data As Byte())
-        SendDataInternal(targetSocket, data)
+    Public Sub SendData(socketId As Integer, data As Byte())
+        SendDataInternal(socketId, data)
     End Sub
 
-    Private Sub SendDataInternal(targetSocket As Integer, data As Byte())
-        Dim uploadedBytes As Long = data.Length
+    Private Sub SendDataInternal(socketId As Integer, data As Byte())
+        If Not OnlineClients.Contains(socketId) Then Return
+
+        Dim s = _sockets(socketId)
+        If s Is Nothing OrElse Not s.Connected Then Return
+
         Try
-            Using bufferStream As New MemoryStream
-                bufferStream.Write(data, 0, data.Length)
-                bufferStream.Write(Encoding.UTF8.GetBytes(_packetDelimiter), 0, _packetDelimiter.Length)
-                _sockets(targetSocket).Send(bufferStream.ToArray(), 0, bufferStream.Length, SocketFlags.None)
-            End Using
-            RaiseEvent UploadedBytesCount(uploadedBytes, FormatBytes(uploadedBytes))
+            ' Calculate total payload size (original data + delimiter)
+            Dim payloadLength As Integer = data.Length + _delimiter.Length
+
+            ' Packet layout:
+            ' [0]    = PacketType.Delimited (1 byte)
+            ' [1..4] = payloadLen (Int32 LE)
+            ' [5..]  = data + delimiter
+
+            ' Calculate total packet size including header
+            Dim totalPacketLength As Integer = 1 + 4 + payloadLength
+            Dim buf = ArrayPool(Of Byte).Shared.Rent(totalPacketLength)
+
+            Try
+                Dim pos As Integer = 0
+                ' Write packet type identifier
+                buf(pos) = PacketType.Delimited
+                pos += 1
+
+                ' Write payload length as 4-byte integer (Little Endian)
+                Buffer.BlockCopy(BitConverter.GetBytes(payloadLength), 0, buf, pos, 4)
+                pos += 4
+
+                ' Write the actual data
+                Buffer.BlockCopy(data, 0, buf, pos, data.Length)
+                pos += data.Length
+
+                ' Append the configured delimiter (used by the receiver's parser to detect packet boundaries)
+                Buffer.BlockCopy(_delimiter, 0, buf, pos, _delimiter.Length)
+                pos += _delimiter.Length
+
+                SyncLock s
+                    SendAll(s, buf, 0, totalPacketLength)
+                End SyncLock
+                RaiseEvent UploadedBytesCount(data.Length, FormatBytes(data.Length))
+            Finally
+                ArrayPool(Of Byte).Shared.Return(buf, clearArray:=True)
+            End Try
+
         Catch ex As Exception
             RaiseEvent OnExceptionOccurred(ex)
-            DisconnectClient(targetSocket)
+            DisconnectClient(socketId)
         End Try
+    End Sub
+
+    Private Sub SendAll(socket As Socket, buffer As Byte(), offset As Integer, count As Integer)
+        Dim sent As Integer = 0
+        While sent < count
+            Dim n As Integer
+            Try
+                n = socket.Send(buffer, offset + sent, count - sent, SocketFlags.None)
+            Catch ex As SocketException
+                RaiseEvent OnExceptionOccurred(New IOException($"Socket send failed: {ex.Message}", ex))
+                Return ' Stop sending on error
+            Catch ex As ObjectDisposedException
+                RaiseEvent OnExceptionOccurred(New IOException("Socket disposed during send.", ex))
+                Return
+            End Try
+
+            If n <= 0 Then
+                RaiseEvent OnExceptionOccurred(New IOException("Socket closed during send."))
+                Return
+            End If
+
+            sent += n
+        End While
     End Sub
 
     Public Sub Broadcast(data As String, Optional excludeSocket As Integer? = Nothing)
@@ -269,14 +346,16 @@ Public Class TcpServer
         End If
 
         Try
+            ' Capture the socket reference once to avoid race conditions
+            Dim socketToDisconnect = _sockets(targetSocket)
+
             ' Validate socket index
             If targetSocket < 0 OrElse targetSocket >= _sockets.Length Then
                 Log(LogLevel.Error, $"Invalid socket index: {targetSocket}")
                 Return
             End If
 
-            ' Capture the socket reference once to avoid race conditions
-            Dim socketToDisconnect = _sockets(targetSocket)
+            ' Use single captured reference for check
             If socketToDisconnect IsNot Nothing Then
                 SyncLock socketToDisconnect
 
@@ -294,6 +373,8 @@ Public Class TcpServer
                             End If
                         Catch socketEx As SocketException
                             If LogDebug Then Log(LogLevel.Debug, $"Socket exception during disconnect: {socketEx.Message}")
+                        Catch ex As Exception
+                            RaiseEvent OnExceptionOccurred(ex)
                         End Try
                     End If
 
@@ -395,11 +476,33 @@ Public Class TcpServer
 
     Private Sub InitializeClient(socketId As Integer, ByRef clientSocket As Socket)
         SyncLock _sockets
+            ' Verify we still own this slot
+            If Not _onlineClients.ContainsKey(socketId) Then
+                Log(LogLevel.Error, $"Socket {socketId} was deallocated before initialization")
+                clientSocket.Close()
+                Return
+            End If
+
+            ' Verify the slot is still available (should be Nothing)
+            If _sockets(socketId) IsNot Nothing Then
+                Log(LogLevel.Error, $"Socket {socketId} already occupied")
+                clientSocket.Close()
+                _onlineClients.TryRemove(socketId, Nothing)
+                Return
+            End If
+
+            ' Assign the actual socket
             _sockets(socketId) = clientSocket
             _disconnectFlags(socketId) = False
         End SyncLock
 
         Dim clientIpAddress = clientSocket.RemoteEndPoint.ToString()
+
+        ' Check for duplicate IP (potential race condition indicator)
+        If _clientIpAddresses.Values.Contains(clientIpAddress) Then
+            Log(LogLevel.Warning, $"IP {clientIpAddress} already connected on another socket")
+        End If
+
         _clientIpAddresses.TryAdd(socketId, clientIpAddress)
 
         ' Assign client to a new thread
@@ -436,7 +539,7 @@ Public Class TcpServer
     End Function
 
     Private Function AllocateSocket() As Integer
-        SyncLock _clientHandlerThread ' Lock on '_sockets' should also work here
+        SyncLock _sockets
             ' First check if we have capacity
             If _onlineClients.Count >= MaxClients Then
                 Log(LogLevel.Warning, $"Connection rejected. Server at maximum capacity ({MaxClients} clients)")
@@ -445,15 +548,18 @@ Public Class TcpServer
 
             ' Look for available socket slot
             For i = 0 To MaxClients - 1
-                If _sockets(i) Is Nothing Then
+                ' Check both socket and online client status
+                If _sockets(i) Is Nothing AndAlso Not _onlineClients.ContainsKey(i) Then
+                    ' Reserve the slot immediately
                     _onlineClients.TryAdd(i, i)
+                    ' DON'T add a placeholder - just leave it as Nothing
+                    ' The slot is now reserved via _onlineClients
                     Return i
                 End If
             Next
         End SyncLock
 
-        ' This should never happen due to count check above, but keep as safety check
-        Log(LogLevel.Error, "No available sockets")
+        Log(LogLevel.Error, "No available sockets despite capacity check")
         Return -1
     End Function
 
@@ -477,40 +583,47 @@ Public Class TcpServer
         Dim buffer As Byte() = ArrayPool(Of Byte).Shared.Rent(bufferSize)
         Dim bufferStream As New MemoryStream()
 
+        ' Check if socket is valid
         If _sockets(clientSocket) Is Nothing Then
-            ' Exit thread early if socket is actually dead
+            ArrayPool(Of Byte).Shared.Return(buffer, clearArray:=True)
+            Return
+        End If
+
+        ' Additional type check to be safe
+        If TypeOf _sockets(clientSocket) IsNot Socket Then
+            Log(LogLevel.Error, $"Socket {clientSocket} is not a valid Socket object")
+            ArrayPool(Of Byte).Shared.Return(buffer, clearArray:=True)
+            _onlineClients.TryRemove(clientSocket, Nothing)
+            _sockets(clientSocket) = Nothing
             Return
         End If
 
         Try
             While Not _stopping AndAlso Not _disconnectFlags.GetOrAdd(clientSocket, False)
                 Try
-                    ' Ensure client is still connected
                     If Not IsClientAlive(clientSocket, pollCount) Then
                         Exit While
                     End If
 
-                    ' If no data is available, just skip ahead
                     If _sockets(clientSocket).Available <= 0 Then
                         Continue While
                     End If
 
+                    Dim s = _sockets(clientSocket)
+                    If s Is Nothing OrElse Not s.Connected Then Exit While
+
                     ' Read available data
-                    Dim availableData As Integer = _sockets(clientSocket).Receive(buffer, 0, buffer.Length, SocketFlags.None)
+                    Dim availableData As Integer
+                    SyncLock s
+                        availableData = s.Receive(buffer, 0, buffer.Length, SocketFlags.None)
+                    End SyncLock
                     If availableData > 0 Then
-                        If _streamingClients.ContainsKey(clientSocket) Then
-                            ' Streaming Mode: Directly raise event
-                            Dim streamData(availableData - 1) As Byte
-                            System.Buffer.BlockCopy(buffer, 0, streamData, 0, availableData) ' Not optimal, but the event should be as simple as possible
-                            RaiseEvent OnStreamDataReceived(streamData)
-                        Else
-                            ' Delimiter Mode: Append received data to buffer stream for processing
-                            bufferStream.Write(buffer, 0, availableData)
-                            ProcessClientData(clientSocket, bufferStream)
-                        End If
+                        ' ALWAYS append to buffer and process through unified system
+                        bufferStream.Write(buffer, 0, availableData)
+                        ProcessClientData(clientSocket, bufferStream)
                     End If
-                Catch objectDisposedEx As ObjectDisposedException
-                    ' Swallow it silently, this doesn't matter since client will be cleaned up
+                Catch objDisposedEx As ObjectDisposedException
+                    ' Exit silently
                 Catch ex As Exception
                     RaiseEvent OnDataHandlerException(clientSocket, ex)
                     Exit While
@@ -518,14 +631,10 @@ Public Class TcpServer
 
                 Thread.Sleep(1)
             End While
-        Catch objectDisposedEx As ObjectDisposedException
-            pollCount = 0
-            ' Swallow it silently, this doesn't matter since client will be cleaned up
         Catch ex As Exception
             pollCount = 0
             RaiseEvent OnDataHandlerException(clientSocket, ex)
         Finally
-            ' Cleanup resources
             ArrayPool(Of Byte).Shared.Return(buffer, clearArray:=True)
             bufferStream.Dispose()
             DisconnectClient(clientSocket)
@@ -534,6 +643,9 @@ Public Class TcpServer
 
     Private Function IsClientAlive(clientSocket As Integer, ByRef pollCount As Integer) As Boolean
         pollCount += 1
+
+        Dim s = _sockets(clientSocket)
+        If s Is Nothing OrElse Not s.Connected Then Return False
 
         If pollCount = PollInterval Then
             Try
@@ -545,13 +657,15 @@ Public Class TcpServer
                     Return False
                 End If
 
-                If _sockets(clientSocket).Poll(100, SelectMode.SelectRead) AndAlso _sockets(clientSocket).Available <= 0 Then
-                    Return False
-                End If
-            Catch ex As ObjectDisposedException
+                SyncLock s
+                    If s.Poll(100, SelectMode.SelectRead) AndAlso s.Available <= 0 Then
+                        Return False
+                    End If
+                End SyncLock
+            Catch objDisposedEx As ObjectDisposedException
                 ' Socket was disposed
                 Return False
-            Catch ex As SocketException
+            Catch socketEx As SocketException
                 Return False
             Catch ex As Exception
                 RaiseEvent OnExceptionOccurred(ex)
@@ -570,64 +684,82 @@ Public Class TcpServer
     End Function
 
     Private Sub ProcessClientData(clientSocket As Integer, ByRef bufferStream As MemoryStream)
-        ' Early check for buffer overflow
-        If bufferStream.Length > MaxBufferSize Then
-            HandleBufferOverflow(clientSocket)
-            Return
-        End If
+        ' Need at least header and check for overflow
+        If bufferStream.Length < 5 Then Return
+        If bufferStream.Length >= MaxBufferSize Then HandleBufferOverflow(clientSocket)
 
-        ' Rent a buffer from the pool instead of calling ToArray()
-        Dim bufferLength As Long = bufferStream.Length
-        Dim buffer As Byte() = ArrayPool(Of Byte).Shared.Rent(bufferLength)
-
+        ' Cache before we mutate
+        Dim totalLength As Integer = bufferStream.Length
+        Dim buffer As Byte() = ArrayPool(Of Byte).Shared.Rent(totalLength)
         Try
             bufferStream.Position = 0
-            bufferStream.Read(buffer, 0, bufferLength)
+            bufferStream.Read(buffer, 0, bufferStream.Length)
 
             Dim currentPosition As Integer = 0
-            Dim processedData As Boolean = False
+            Dim processedUpTo As Integer = 0
 
-            ' Process all packets in the buffer in a single pass
-            While currentPosition < bufferLength
-                Dim delimiterIndex = FindDelimiter(buffer, _delimiter, bufferLength, currentPosition)
+            While currentPosition + 5 <= totalLength
+                ' Read packet header
+                Dim packetType = CType(buffer(currentPosition), PacketType)
+                Dim packetLength = BitConverter.ToInt32(buffer, currentPosition + 1)
 
-                If delimiterIndex < 0 Then
+                ' Check for incomplete data
+                If currentPosition + 5 + packetLength > totalLength Then
                     Exit While
                 End If
+                currentPosition += 5
 
-                Dim packetLength = delimiterIndex - currentPosition
+                ' Process based on packet type
+                Select Case packetType
+                    Case PacketType.Stream
+                        ' Handle streaming data - CLIENT SPECIFIC
+                        Dim streamData(packetLength - 1) As Byte
+                        System.Buffer.BlockCopy(buffer, currentPosition, streamData, 0, packetLength)
+                        If _streamingClients.ContainsKey(clientSocket) Then
+                            ' This should be client-specific from server, not global!
+                            ' Not critical for now, but will need re-work later if current implementation causes limitations
+                            RaiseEvent OnStreamDataReceived(clientSocket, streamData)
+                        End If
 
-                If packetLength > MaxPacketSize Then
-                    Log(LogLevel.Warning, $"Client {clientSocket}: Packet size exceeds maximum allowed size {FormatBytes(MaxPacketSize)}. Client will be kicked!")
-                    _disconnectFlags(clientSocket) = True
-                    Return
-                End If
+                    Case PacketType.Delimited
+                        ' Process as delimited packet
+                        Dim temp(packetLength - 1) As Byte
+                        System.Buffer.BlockCopy(buffer, currentPosition, temp, 0, packetLength)
+                        ProcessDelimitedData(clientSocket, temp, packetLength)
+                End Select
 
-                ' Extract packet data - still need to allocate this unfortunately
-                Dim packetData(packetLength - 1) As Byte
-                System.Buffer.BlockCopy(buffer, currentPosition, packetData, 0, packetLength)
-
-                ProcessPacket(clientSocket, packetData, _imagePrefix)
-
-                currentPosition = delimiterIndex + _delimiter.Length
-                processedData = True
-
-                If LogDebug Then Log(LogLevel.Debug, $"Client({clientSocket}) packet processed: {packetLength} bytes")
+                currentPosition += packetLength
+                processedUpTo = currentPosition
             End While
 
-            ' If we've processed data, rebuild the buffer with any remaining data
-            If processedData Then
+            ' Keep the leftover (partial) bytes
+            If processedUpTo > 0 Then
+                Dim remaining = totalLength - processedUpTo
                 bufferStream.SetLength(0)
-                If currentPosition < bufferLength Then
-                    bufferStream.Write(buffer, currentPosition, bufferLength - currentPosition)
-                End If
+                If remaining > 0 Then bufferStream.Write(buffer, processedUpTo, remaining)
             End If
         Catch ex As Exception
-            RaiseEvent OnExceptionOccurred(ex)
+            RaiseEvent OnDataHandlerException(clientSocket, ex)
         Finally
-            ' Always return the buffer to the pool
             ArrayPool(Of Byte).Shared.Return(buffer, clearArray:=True)
         End Try
+    End Sub
+
+    Private Sub ProcessDelimitedData(clientSocket As Integer, buffer As Byte(), length As Integer)
+        Dim currentPos = 0
+        While currentPos < length
+            Dim delimiterIndex = FindDelimiter(buffer, _delimiter, length, currentPos)
+            If delimiterIndex < 0 Then Exit While
+
+            Dim packetLength = delimiterIndex - currentPos
+            If packetLength > 0 Then
+                Dim packetData(packetLength - 1) As Byte
+                System.Buffer.BlockCopy(buffer, currentPos, packetData, 0, packetLength)
+                ProcessPacket(clientSocket, packetData, _imagePrefix)
+            End If
+
+            currentPos = delimiterIndex + _delimiter.Length
+        End While
     End Sub
 
     Private Sub HandleBufferOverflow(clientSocket As Integer)
@@ -636,14 +768,16 @@ Public Class TcpServer
     End Sub
 
     Private Sub ProcessPacket(clientSocket As Integer, ByRef packetData As Byte(), imagePrefix As Byte())
-        Dim isImagePacket As Boolean = packetData.AsSpan(0, imagePrefix.Length).SequenceEqual(imagePrefix)
-        If Not isImagePacket Then
-            RaiseEvent OnDataReceived(clientSocket, packetData)
-        Else
+        ' Check if it's an image packet first (legacy support)
+        If packetData.Length >= imagePrefix.Length AndAlso packetData.AsSpan(0, imagePrefix.Length).SequenceEqual(imagePrefix) Then
             Dim imageData As Byte() = ExtractImageData(packetData, imagePrefix.Length)
             RaiseEvent OnImageDataReceived(clientSocket, imageData)
+        Else
+            ' Pass to packet handler for processing
+            RaiseEvent OnDataReceived(clientSocket, packetData)
         End If
     End Sub
+
 
     Private Shared Function ExtractImageData(ByRef packetData As Byte(), prefixLength As Integer) As Byte()
         ' Extracts image data by removing the image packet prefix
@@ -720,7 +854,7 @@ Public Class TcpServer
 
 #End Region
 
-#End Region ' This should probably be modularized, hehe
+#End Region
 
 #Region "# Utilities #"
 
@@ -890,67 +1024,38 @@ Public Class TcpServer
     Private Const DISPOSE_TIMEOUT As Integer = 5000
     Private Const DELAY As Integer = 100
     Protected Overridable Sub Dispose(disposing As Boolean)
-        ' Use timeout for lock acquisition
-        If Monitor.TryEnter(_disposeLock, DISPOSE_TIMEOUT) Then
+        If _disposed Then Return
+
+        ' Mark as disposed immediately to prevent re-entry
+        _disposed = True
+
+        If disposing Then
+            ' Best-effort cleanup - don't let one failure prevent others
             Try
-                If Not _disposed Then
-                    If disposing Then
-                        Try
-                            [Stop]()
-                        Catch
-                            _stopping = True ' Signal threads to stop
-                            Thread.Sleep(DELAY) ' Give threads time to notice - only if Stop() failed
-                            If _tcpListener IsNot Nothing Then
-                                Try
-                                    _tcpListener.Stop()
-                                    _tcpListener.Dispose()
-                                    _tcpListener = Nothing
-                                Catch
-                                    ' Ignore disposal errors
-                                End Try
-                            End If
-                        Finally
-                            DisconnectAllClients()
-                        End Try
-
-                        If _clientHandlerThread IsNot Nothing AndAlso _clientHandlerThread.IsAlive Then
-                            Try
-                                If Not _clientHandlerThread.Join(1000) Then ' Shorter timeout in dispose
-                                    _clientHandlerThread.Interrupt()
-                                End If
-                            Catch
-                                ' Ignore thread cleanup errors
-                            End Try
-                        End If
-
-                        Try
-                            _clientsAvailable?.Dispose()
-                        Catch
-                            ' Ignore disposal errors
-                        End Try
-
-                        ' Clean up remaining resources
-                        For Each socket In _sockets
-                            Try
-                                socket?.Dispose()
-                            Catch
-                                ' Ignore disposal errors
-                            End Try
-                        Next
-
-                        _clientIpAddresses.Clear()
-                        _onlineClients.Clear()
-                        _streamingClients.Clear()
-                        _disconnectFlags.Clear()
-                        _connectionAttempts.Clear()
-                    End If
-                    _disposed = True
-                End If
-            Finally
-                Monitor.Exit(_disposeLock)
+                [Stop]()
+            Catch ex As Exception
+                ' Log but continue cleanup
+                RaiseEvent LogEvent(LogLevel.Error, Now, $"Error during Stop: {ex.Message}")
             End Try
-        Else
-            RaiseEvent LogEvent(LogLevel.Error, Now, "Dispose lock acquisition failed. Possible deadlock")
+
+            Try
+                _clientsAvailable?.Dispose()
+            Catch
+            End Try
+
+            For Each socket In _sockets
+                Try
+                    socket?.Dispose()
+                Catch
+                End Try
+            Next
+
+            ' Clear collections
+            _clientIpAddresses.Clear()
+            _onlineClients.Clear()
+            _streamingClients.Clear()
+            _disconnectFlags.Clear()
+            _connectionAttempts.Clear()
         End If
     End Sub
 
@@ -970,14 +1075,3 @@ Public Class TcpServer
 #End Region
 
 End Class
-
-Public Enum LogLevel
-
-    Ok
-    Info
-    EventHappend
-    Warning
-    [Error]
-    Debug
-
-End Enum
